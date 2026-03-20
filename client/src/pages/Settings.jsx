@@ -1,21 +1,76 @@
 import { useEffect, useState } from 'react';
+import { doc, serverTimestamp, setDoc } from 'firebase/firestore';
 import { usePulseTwin } from '../state/PulseTwinProvider.jsx';
+import { db } from '../lib/firebase.js';
+import { useAuth } from '../state/AuthProvider.jsx';
 
 export default function Settings() {
   const { bodyTwin, setBodyTwin } = usePulseTwin();
+  const { user } = useAuth();
 
   const [affordableMode, setAffordableMode] = useState(Boolean(bodyTwin?.affordableMode));
   const [budgetRupees, setBudgetRupees] = useState(
-    Number(bodyTwin?.budget?.dailyFoodBudgetRupees ?? 150)
+    Number(bodyTwin?.budget?.dailyFoodBudgetRupees ?? 1500)
   );
   const [dietaryPreference, setDietaryPreference] = useState(bodyTwin?.dietaryPreference ?? 'non-veg');
   const [busy, setBusy] = useState(false);
+  const [saveState, setSaveState] = useState('idle'); // idle | saved | error
 
   useEffect(() => {
     setAffordableMode(Boolean(bodyTwin?.affordableMode));
     setBudgetRupees(Number(bodyTwin?.budget?.dailyFoodBudgetRupees ?? 150));
     setDietaryPreference(bodyTwin?.dietaryPreference ?? 'non-veg');
   }, [bodyTwin]);
+
+  const onSave = async () => {
+    const safeBudget = Number.isFinite(Number(budgetRupees)) && Number(budgetRupees) > 0
+      ? Number(budgetRupees)
+      : 1500;
+
+    const nextBodyTwin = {
+      ...bodyTwin,
+      affordableMode,
+      dietaryPreference,
+      budget: {
+        ...(bodyTwin?.budget || {}),
+        dailyFoodBudgetRupees: safeBudget
+      },
+      updatedAt: new Date().toISOString()
+    };
+
+    setBusy(true);
+    setSaveState('idle');
+    try {
+      // Update local app state immediately.
+      setBodyTwin(nextBodyTwin);
+
+      // Persist explicitly to Firestore from Settings for deterministic UX.
+      if (user?.uid) {
+        await setDoc(
+          doc(db, 'users', user.uid, 'bodyTwin', 'current'),
+          {
+            ...nextBodyTwin,
+            updatedAt: serverTimestamp()
+          },
+          { merge: true }
+        );
+      }
+
+      setSaveState('saved');
+    } catch (e) {
+      setSaveState('error');
+      window.dispatchEvent(
+        new CustomEvent('pulse-toast', {
+          detail: {
+            type: 'error',
+            message: `Failed to save preferences: ${e?.message || 'unknown error'}`
+          }
+        })
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <div className="pt-page">
@@ -59,25 +114,19 @@ export default function Settings() {
 
           <button
             type="button"
-            onClick={() => {
-              setBusy(true);
-              setBodyTwin((prev) => ({
-                ...prev,
-                affordableMode,
-                dietaryPreference,
-                budget: {
-                  ...(prev?.budget || {}),
-                  dailyFoodBudgetRupees: Number(budgetRupees)
-                },
-                updatedAt: new Date().toISOString()
-              }));
-              setBusy(false);
-            }}
+            onClick={onSave}
             className="pt-btn-primary mt-8"
             disabled={busy}
           >
             {busy ? 'Saving...' : 'Save'}
           </button>
+
+          {saveState === 'saved' ? (
+            <p className="mt-3 text-xs text-fit-lime">Preferences saved.</p>
+          ) : null}
+          {saveState === 'error' ? (
+            <p className="mt-3 text-xs text-red-400">Could not save preferences. Please retry.</p>
+          ) : null}
 
           <p className="mt-4 text-xs text-zinc-500">
             Updates apply to the Grocery agent&apos;s list generation.

@@ -7,6 +7,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import twilio from 'twilio';
+import admin from 'firebase-admin';
 
 dotenv.config();
 
@@ -27,14 +28,85 @@ function requireOpenAiKey() {
 
 const openai = new OpenAI({ apiKey: requireOpenAiKey() });
 
+function getFirestoreAdminOrNull() {
+  if (admin.apps.length) return admin.firestore();
+
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY;
+
+  if (!projectId || !clientEmail || !privateKeyRaw) return null;
+
+  const privateKey = privateKeyRaw.replace(/\\n/g, '\n');
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId,
+      clientEmail,
+      privateKey
+    })
+  });
+  return admin.firestore();
+}
+
+const firestoreDb = getFirestoreAdminOrNull();
+
 function extractJson(text) {
-  const s = text || '';
+  const s = stripJsonFences(text || '');
   const start = s.indexOf('{');
   const end = s.lastIndexOf('}');
   if (start === -1 || end === -1 || end <= start) {
     throw new Error('Failed to extract JSON from model output');
   }
   return JSON.parse(s.slice(start, end + 1));
+}
+
+function stripJsonFences(s) {
+  const t = String(s).trim();
+  const m = t.match(/^```(?:json)?\s*([\s\S]*?)```$/i);
+  return m ? m[1].trim() : t;
+}
+
+function score1to10(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(10, Math.max(1, Math.round(n)));
+}
+
+function normalizeMoodPayload(raw) {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      moodScore: null,
+      energyLevel: null,
+      complaints: [],
+      recoveryScore: null
+    };
+  }
+  const moodScore =
+    score1to10(raw.moodScore ?? raw.mood_score ?? raw.mood) ?? null;
+  const recoveryScore =
+    score1to10(
+      raw.recoveryScore ??
+        raw.recovery_score ??
+        raw.recovery ??
+        raw.readiness ??
+        raw.readinessScore
+    ) ?? null;
+  let energyLevel = raw.energyLevel ?? raw.energy_level ?? raw.energy ?? null;
+  if (typeof energyLevel === 'string') {
+    const e = energyLevel.toLowerCase();
+    if (['low', 'medium', 'high'].includes(e)) energyLevel = e;
+    else energyLevel = null;
+  }
+  let complaints = raw.complaints ?? raw.complaint ?? [];
+  if (typeof complaints === 'string') complaints = [complaints];
+  if (!Array.isArray(complaints)) complaints = [];
+
+  return {
+    moodScore,
+    energyLevel,
+    complaints: complaints.map((x) => String(x)).filter(Boolean),
+    recoveryScore
+  };
 }
 
 function extractJsonArray(text) {
@@ -83,6 +155,78 @@ async function writeJsonFile(filePath, data) {
   const dir = path.dirname(filePath);
   await fs.mkdir(dir, { recursive: true });
   await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+function safeDocId(v) {
+  return String(v || '')
+    .trim()
+    .replace(/[\/\s]+/g, '_')
+    .slice(0, 180);
+}
+
+async function getGroceryWeekDoc(userId, weekId) {
+  if (firestoreDb) {
+    const ref = firestoreDb
+      .collection('grocery_lists')
+      .doc(String(userId))
+      .collection('weeks')
+      .doc(String(weekId));
+    const snap = await ref.get();
+    return snap.exists ? snap.data() : null;
+  }
+  return readJsonFile(groceryListFilePath(userId, weekId));
+}
+
+async function setGroceryWeekDoc(userId, weekId, data) {
+  if (firestoreDb) {
+    const ref = firestoreDb
+      .collection('grocery_lists')
+      .doc(String(userId))
+      .collection('weeks')
+      .doc(String(weekId));
+    await ref.set(
+      {
+        ...data,
+        updatedAt: new Date().toISOString()
+      },
+      { merge: true }
+    );
+    return;
+  }
+  await writeJsonFile(groceryListFilePath(userId, weekId), data);
+}
+
+async function getPendingReply(fromWhatsapp) {
+  if (firestoreDb) {
+    const ref = firestoreDb.collection('grocery_whatsapp_pending').doc(safeDocId(fromWhatsapp));
+    const snap = await ref.get();
+    return snap.exists ? snap.data() : null;
+  }
+  return readJsonFile(pendingReplyFilePath(fromWhatsapp));
+}
+
+async function setPendingReply(fromWhatsapp, data) {
+  if (firestoreDb) {
+    const ref = firestoreDb.collection('grocery_whatsapp_pending').doc(safeDocId(fromWhatsapp));
+    await ref.set(
+      {
+        ...data,
+        updatedAt: new Date().toISOString()
+      },
+      { merge: true }
+    );
+    return;
+  }
+  await writeJsonFile(pendingReplyFilePath(fromWhatsapp), data);
+}
+
+async function clearPendingReply(fromWhatsapp) {
+  if (firestoreDb) {
+    const ref = firestoreDb.collection('grocery_whatsapp_pending').doc(safeDocId(fromWhatsapp));
+    await ref.delete().catch(() => null);
+    return;
+  }
+  await fs.unlink(pendingReplyFilePath(fromWhatsapp)).catch(() => null);
 }
 
 function normalizeWhatsAppAddress(v) {
@@ -189,7 +333,77 @@ function normalizeGroceryInputsFromBodyTwin(bodyTwin) {
   };
 }
 
-async function generateGroceryListFromGaps({ bodyTwin }) {
+function computeDeficiencySignals({ bodyTwin, nutritionLogs }) {
+  const weeklyNutritionGaps = bodyTwin?.weeklyNutritionGaps || bodyTwin?.nutritionGaps || [];
+
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const todaysEntries = Array.isArray(nutritionLogs?.[todayKey]) ? nutritionLogs[todayKey] : [];
+  const totals = todaysEntries.reduce(
+    (acc, e) => {
+      acc.calories += Number(e?.calories || 0);
+      acc.protein += Number(e?.protein || 0);
+      acc.carbs += Number(e?.carbs || 0);
+      acc.fat += Number(e?.fat || 0);
+      return acc;
+    },
+    { calories: 0, protein: 0, carbs: 0, fat: 0 }
+  );
+
+  const targets = { protein: 70, carbs: 220, fat: 60, calories: 2000 };
+  const macroDeficiencies = Object.keys(targets)
+    .map((k) => ({ key: k, missing: Math.max(0, targets[k] - Number(totals[k] || 0)) }))
+    .filter((x) => x.missing > 0);
+
+  return {
+    weeklyNutritionGaps,
+    todayMacroTotals: totals,
+    macroDeficiencies
+  };
+}
+
+async function generateMealSuggestionsFromDeficiency({
+  bodyTwin,
+  nutritionLogs,
+  budget,
+  dietaryPreference
+}) {
+  const deficiency = computeDeficiencySignals({ bodyTwin, nutritionLogs });
+  const prompt = [
+    'You are a practical Indian nutrition coach.',
+    `Dietary preference: ${dietaryPreference}.`,
+    `Daily food budget: Rs ${budget}.`,
+    `Weekly nutrition gaps: ${JSON.stringify(deficiency.weeklyNutritionGaps)}.`,
+    `Today macro totals: ${JSON.stringify(deficiency.todayMacroTotals)}.`,
+    `Detected macro deficiencies: ${JSON.stringify(deficiency.macroDeficiencies)}.`,
+    'Suggest 5 simple Indian meals/snacks for tomorrow to cover these deficiencies.',
+    'Return ONLY JSON array with schema:',
+    '[',
+    '  {',
+    '    "meal": string,',
+    '    "why": string,',
+    '    "keyNutrients": string[],',
+    '    "estimatedCost": number',
+    '  }',
+    ']'
+  ].join('\n');
+
+  const response = await openai.responses.create({
+    model: 'gpt-4o',
+    input: [{ role: 'user', content: [{ type: 'input_text', text: prompt }] }],
+    max_output_tokens: 700
+  });
+
+  const outputText = response?.output_text || '';
+  const parsed = extractJsonArray(outputText);
+  return (Array.isArray(parsed) ? parsed : []).map((m) => ({
+    meal: String(m?.meal || ''),
+    why: String(m?.why || ''),
+    keyNutrients: Array.isArray(m?.keyNutrients) ? m.keyNutrients.map((x) => String(x)) : [],
+    estimatedCost: Number(m?.estimatedCost || 0)
+  }));
+}
+
+async function generateGroceryListFromGaps({ bodyTwin, nutritionLogs }) {
   const { weeklyNutritionGaps, budget, affordableModeOn, dietaryPreference } =
     normalizeGroceryInputsFromBodyTwin(bodyTwin);
 
@@ -251,7 +465,79 @@ Prioritize locally available Indian items.`;
     totalCost = items.reduce((acc, it) => acc + (Number(it.estimatedPrice) || 0), 0);
   }
 
-  return { items, totalCost };
+  const mealSuggestions = await generateMealSuggestionsFromDeficiency({
+    bodyTwin,
+    nutritionLogs,
+    budget,
+    dietaryPreference
+  });
+
+  return { items, totalCost, mealSuggestions };
+}
+
+function getWeekId(d = new Date()) {
+  const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const day = date.getUTCDay();
+  const diffToMonday = (day + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - diffToMonday);
+  return date.toISOString().slice(0, 10);
+}
+
+function detectVoiceIntentByRules(transcript) {
+  const t = String(transcript || '').toLowerCase();
+  const hasGrocery =
+    /\bgrocery\b|\bshopping\b|\bbuy food\b|\bbuy groceries\b|\bfood list\b|\bcreate list\b|\bweekly list\b|\bkitchen\b/.test(
+      t
+    );
+  const hasWorkout =
+    /\bworkout\b|\bexercise\b|\btraining\b|\bgym\b|\bplan my workout\b|\bopen workout\b|\bregenerate workout\b|\btoday'?s workout\b/.test(
+      t
+    );
+  const hasSummary =
+    /\brecovery\b|\bsummary\b|\bhow am i\b|\bstatus\b|\bmood\b|\bhealth summary\b/.test(t);
+
+  if (hasGrocery) return 'generate_grocery';
+  if (hasWorkout) return 'generate_workout';
+  if (hasSummary) return 'recovery_summary';
+  return 'unknown';
+}
+
+async function detectVoiceIntent(transcript) {
+  const byRules = detectVoiceIntentByRules(transcript);
+  if (byRules !== 'unknown') return byRules;
+
+  // Fallback: classify ambiguous commands with a lightweight model.
+  const prompt = [
+    'Classify this fitness app command into one intent.',
+    'Valid intents:',
+    '- generate_workout',
+    '- generate_grocery',
+    '- recovery_summary',
+    'Return ONLY JSON like {"intent":"generate_workout"}.',
+    `Command: ${String(transcript || '')}`
+  ].join('\n');
+
+  try {
+    const cls = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'You are a strict intent classifier. Output JSON only.' },
+        { role: 'user', content: prompt }
+      ],
+      response_format: { type: 'json_object' },
+      max_completion_tokens: 80
+    });
+    const raw = cls?.choices?.[0]?.message?.content || '';
+    const parsed = JSON.parse(stripJsonFences(raw));
+    const intent = String(parsed?.intent || '').trim();
+    if (intent === 'generate_workout' || intent === 'generate_grocery' || intent === 'recovery_summary') {
+      return intent;
+    }
+  } catch {
+    // ignore and use default fallback
+  }
+
+  return 'recovery_summary';
 }
 
 app.get('/api/health', (req, res) => {
@@ -343,47 +629,50 @@ app.post(
           .json({ success: false, message: 'Empty transcript' });
       }
 
-      // 2) Mood/recovery extraction
-      const analysisPrompt = [
+      // 2) Mood/recovery extraction (Chat Completions + JSON is more reliable than Responses output_text)
+      const analysisUserPrompt = [
         'You are an empathetic fitness coach.',
-        'Given a user voice transcript, estimate:',
+        'Given the user voice transcript below, estimate:',
         '- moodScore: integer 1-10',
-        "- energyLevel: one of ['low','medium','high']",
-        '- complaints: array of short complaint phrases',
-        '- recoveryScore: integer 1-10',
-        'Return ONLY valid JSON with this exact schema:',
-        '{',
-        '  "moodScore": number,',
-        '  "energyLevel": string,',
-        '  "complaints": string[],',
-        '  "recoveryScore": number',
-        '}',
+        "- energyLevel: exactly one of: low, medium, high",
+        '- complaints: array of short complaint phrases (empty array if none)',
+        '- recoveryScore: integer 1-10 (how rested/recovered they seem)',
+        'Return a single JSON object with keys: moodScore, energyLevel, complaints, recoveryScore.',
         'Transcript:',
         transcript
       ].join('\n');
 
-      const moodResp = await openai.responses.create({
+      const moodCompletion = await openai.chat.completions.create({
         model: 'gpt-4o-mini',
-        input: [
+        messages: [
           {
-            role: 'user',
-            content: [{ type: 'input_text', text: analysisPrompt }]
-          }
+            role: 'system',
+            content:
+              'You output only valid JSON objects. No markdown, no explanation.'
+          },
+          { role: 'user', content: analysisUserPrompt }
         ],
-        max_output_tokens: 250
+        response_format: { type: 'json_object' },
+        max_completion_tokens: 250
       });
 
-      const outputText = moodResp?.output_text || '';
-      const parsed = extractJson(outputText);
+      const outputText = moodCompletion?.choices?.[0]?.message?.content || '';
+      let parsed;
+      try {
+        parsed = JSON.parse(stripJsonFences(outputText));
+      } catch {
+        parsed = extractJson(outputText);
+      }
+      const mood = normalizeMoodPayload(parsed);
 
       res.json({
         success: true,
         data: {
           transcript,
-          moodScore: parsed.moodScore ?? null,
-          energyLevel: parsed.energyLevel ?? null,
-          complaints: parsed.complaints ?? [],
-          recoveryScore: parsed.recoveryScore ?? null
+          moodScore: mood.moodScore,
+          energyLevel: mood.energyLevel,
+          complaints: mood.complaints,
+          recoveryScore: mood.recoveryScore
         }
       });
     } catch (err) {
@@ -394,6 +683,99 @@ app.post(
     }
   }
 );
+
+app.post('/api/agent/voice-command', async (req, res) => {
+  try {
+    const { transcript, userId, weekId, bodyTwin, nutritionLogs, whatsappTo } = req.body || {};
+    if (!transcript) {
+      return res.status(400).json({ success: false, message: 'Missing transcript' });
+    }
+
+    const intent = await detectVoiceIntent(transcript);
+
+    if (intent === 'generate_grocery') {
+      if (!userId || !bodyTwin) {
+        return res
+          .status(400)
+          .json({ success: false, message: 'Missing userId/bodyTwin for grocery action' });
+      }
+
+      const resolvedWeekId = weekId || getWeekId();
+      const { items, totalCost, mealSuggestions } = await generateGroceryListFromGaps({
+        bodyTwin,
+        nutritionLogs
+      });
+
+      const docData = {
+        items,
+        mealSuggestions,
+        totalCost,
+        generatedAt: new Date().toISOString(),
+        approved: false,
+        orderedVia: null
+      };
+      await setGroceryWeekDoc(userId, resolvedWeekId, docData);
+
+      let whatsapp = null;
+      if (whatsappTo) {
+        const msg = formatGroceryWhatsAppMessage({ items, totalCost });
+        whatsapp = await sendWhatsApp({ to: whatsappTo, body: msg });
+        const pendingFrom = normalizeWhatsAppAddress(whatsappTo);
+        if (whatsapp?.ok && pendingFrom) {
+          await setPendingReply(pendingFrom, { userId, weekId: resolvedWeekId });
+        }
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          intent,
+          transcript,
+          message: `Generated weekly grocery list with ${items.length} items under Rs ${totalCost}.`,
+          navigateTo: '/grocery',
+          grocery: { ...docData, weekId: resolvedWeekId },
+          whatsapp
+        }
+      });
+    }
+
+    if (intent === 'generate_workout') {
+      const recoveryScore = Number(bodyTwin?.recoveryScore ?? 5);
+      const level = recoveryScore <= 3 ? 'Low' : recoveryScore >= 7 ? 'High' : 'Medium';
+      return res.json({
+        success: true,
+        data: {
+          intent,
+          transcript,
+          message: `Workout regenerated from latest voice check-in. Recovery ${recoveryScore}/10 -> ${level} intensity session.`,
+          navigateTo: '/workout'
+        }
+      });
+    }
+
+    const moodScore = bodyTwin?.mood?.moodScore ?? null;
+    const recoveryScore = bodyTwin?.recoveryScore ?? null;
+    const complaints = Array.isArray(bodyTwin?.mood?.physicalComplaints)
+      ? bodyTwin.mood.physicalComplaints
+      : [];
+
+    return res.json({
+      success: true,
+      data: {
+        intent: 'recovery_summary',
+        transcript,
+        message: `Recovery ${recoveryScore ?? '-'}/10, mood ${moodScore ?? '-'}/10${
+          complaints.length ? `, complaints: ${complaints.join(', ')}` : ''
+        }.`,
+        navigateTo: null
+      }
+    });
+  } catch (err) {
+    return res
+      .status(500)
+      .json({ success: false, message: err?.message || 'Voice command failed' });
+  }
+});
 
 app.post('/api/body-twin/avatar', async (req, res) => {
   try {
@@ -449,8 +831,7 @@ app.get('/api/grocery/list', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Missing userId or weekId' });
     }
 
-    const filePath = groceryListFilePath(userId, weekId);
-    const data = await readJsonFile(filePath);
+    const data = await getGroceryWeekDoc(userId, weekId);
     if (!data) return res.status(404).json({ success: false, message: 'Not found' });
 
     return res.json({ success: true, data });
@@ -461,7 +842,7 @@ app.get('/api/grocery/list', async (req, res) => {
 
 app.post('/api/grocery/generate', async (req, res) => {
   try {
-    const { userId, weekId, bodyTwin, whatsappTo } = req.body || {};
+    const { userId, weekId, bodyTwin, nutritionLogs, whatsappTo } = req.body || {};
     if (!userId || !weekId) {
       return res.status(400).json({ success: false, message: 'Missing userId or weekId' });
     }
@@ -470,18 +851,22 @@ app.post('/api/grocery/generate', async (req, res) => {
     }
 
     // Step 1: Generate the grocery list with GPT-4o.
-    const { items, totalCost } = await generateGroceryListFromGaps({ bodyTwin });
+    const { items, totalCost, mealSuggestions } = await generateGroceryListFromGaps({
+      bodyTwin,
+      nutritionLogs
+    });
 
     // Step 2: Save the generated list.
     const doc = {
       items,
+      mealSuggestions,
       totalCost,
       generatedAt: new Date().toISOString(),
       approved: false,
       orderedVia: null
     };
 
-    await writeJsonFile(groceryListFilePath(userId, weekId), doc);
+    await setGroceryWeekDoc(userId, weekId, doc);
 
     // Step 3: Send WhatsApp message via Twilio (if configured + whatsappTo provided).
     let whatsapp = null;
@@ -492,7 +877,7 @@ app.post('/api/grocery/generate', async (req, res) => {
       // Track pending reply context so the webhook can update the correct doc.
       const pendingFrom = normalizeWhatsAppAddress(whatsappTo);
       if (whatsapp?.ok && pendingFrom) {
-        await writeJsonFile(pendingReplyFilePath(pendingFrom), { userId, weekId });
+        await setPendingReply(pendingFrom, { userId, weekId });
       }
     } else {
       whatsapp = { ok: false, error: 'whatsappTo missing; generated list saved locally but WhatsApp not sent' };
@@ -513,8 +898,7 @@ app.post('/api/grocery/resend', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Missing userId, weekId, or whatsappTo' });
     }
 
-    const filePath = groceryListFilePath(userId, weekId);
-    const doc = await readJsonFile(filePath);
+    const doc = await getGroceryWeekDoc(userId, weekId);
     if (!doc) return res.status(404).json({ success: false, message: 'Grocery list not found' });
 
     // Step 3: Resend the same WhatsApp list message.
@@ -524,7 +908,7 @@ app.post('/api/grocery/resend', async (req, res) => {
     // Refresh pending mapping for the webhook.
     const pendingFrom = normalizeWhatsAppAddress(whatsappTo);
     if (whatsapp?.ok && pendingFrom) {
-      await writeJsonFile(pendingReplyFilePath(pendingFrom), { userId, weekId });
+      await setPendingReply(pendingFrom, { userId, weekId });
     }
 
     return res.json({ success: true, data: doc, whatsapp });
@@ -548,14 +932,13 @@ app.post('/api/grocery/whatsapp-reply', async (req, res) => {
       return res.status(400).send('<Response></Response>');
     }
 
-    const pending = await readJsonFile(pendingReplyFilePath(from));
+    const pending = await getPendingReply(from);
     if (!pending?.userId || !pending?.weekId) {
       return res.status(404).send('<Response></Response>');
     }
 
     const { userId, weekId } = pending;
-    const filePath = groceryListFilePath(userId, weekId);
-    const doc = await readJsonFile(filePath);
+    const doc = await getGroceryWeekDoc(userId, weekId);
     if (!doc) {
       return res.status(404).send('<Response></Response>');
     }
@@ -563,19 +946,19 @@ app.post('/api/grocery/whatsapp-reply', async (req, res) => {
     if (isYes) {
       // Update Firestore/locally: approved = true
       doc.approved = true;
-      await writeJsonFile(filePath, doc);
+      await setGroceryWeekDoc(userId, weekId, doc);
 
       // Then send deep links message.
       const deepLinksMsg = formatDeepLinksWhatsAppMessage(doc.items);
       await sendWhatsApp({ to: from, body: deepLinksMsg });
     } else if (isNo) {
       doc.approved = false;
-      await writeJsonFile(filePath, doc);
+      await setGroceryWeekDoc(userId, weekId, doc);
     }
 
     // Clear pending mapping after handling a YES/NO.
     if (isYes || isNo) {
-      await fs.unlink(pendingReplyFilePath(from)).catch(() => null);
+      await clearPendingReply(from);
     }
 
     // Twilio expects a quick response.

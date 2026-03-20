@@ -36,7 +36,7 @@ export const defaultBodyTwin = {
   equipmentAvailable: null,
   affordableMode: false,
   // 'veg' | 'non-veg' | 'vegan'
-  dietaryPreference: 'non-veg',
+  dietaryPreference: 'veg',
   updatedAt: null
 };
 

@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { addDoc, collection, serverTimestamp } from 'firebase/firestore';
 import { usePulseTwin } from '../state/PulseTwinProvider.jsx';
+import { useAuth } from '../state/AuthProvider.jsx';
+import { db } from '../lib/firebase.js';
 
 export default function VoiceCheckin() {
   const { setBodyTwin } = usePulseTwin();
+  const { user } = useAuth();
 
   const baseUrl = useMemo(() => import.meta.env.VITE_API_BASE_URL, []);
 
@@ -133,6 +137,21 @@ export default function VoiceCheckin() {
         recoveryScore: data.recoveryScore ?? prev.recoveryScore ?? null,
         updatedAt: new Date().toISOString()
       }));
+
+      // Persist check-in history for timeline/review across reloads.
+      if (!user?.uid) {
+        throw new Error('Firebase user missing. Anonymous auth may be disabled.');
+      }
+
+      await addDoc(collection(db, 'users', user.uid, 'voiceCheckins'), {
+        transcript: data.transcript || '',
+        moodScore: data.moodScore ?? null,
+        energyLevel: data.energyLevel ?? null,
+        complaints: Array.isArray(data.complaints) ? data.complaints : [],
+        recoveryScore: data.recoveryScore ?? null,
+        createdAt: serverTimestamp(),
+        source: 'voice-checkin'
+      });
     } catch (e) {
       const msg = e?.message || 'Voice check-in failed';
       setError(msg);

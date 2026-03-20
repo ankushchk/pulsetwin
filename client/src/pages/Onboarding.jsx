@@ -14,7 +14,7 @@ export default function Onboarding() {
   const [weightKg, setWeightKg] = useState('');
   const [bodyFatPct, setBodyFatPct] = useState('');
   const [muscleMassKg, setMuscleMassKg] = useState('');
-  const [budgetRupees, setBudgetRupees] = useState(150);
+  const [budgetRupees, setBudgetRupees] = useState(1500);
   const [equipmentAvailable, setEquipmentAvailable] = useState(EQUIPMENT_TYPES[0]);
   const [affordableMode, setAffordableMode] = useState(false);
   const [dietaryPreference, setDietaryPreference] = useState('non-veg');

@@ -6,13 +6,17 @@ function clamp(n, min, max) {
   return Math.min(max, Math.max(min, n));
 }
 
-function AvatarCard({ title, subtitle, imageDataUrl, fallbackText }) {
+function AvatarCard({ title, subtitle, imageDataUrl, fallbackText, loading = false }) {
   return (
     <div className="pt-card p-5">
       <div className="pt-label">{title}</div>
       <div className="mt-1 text-xs text-zinc-500">{subtitle}</div>
       <div className="mt-4 overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950/50">
-        {imageDataUrl ? (
+        {loading ? (
+          <div className="flex h-80 items-center justify-center p-5 text-center text-sm text-zinc-500">
+            Generating avatar...
+          </div>
+        ) : imageDataUrl ? (
           <img src={imageDataUrl} alt={title} className="h-80 w-full object-cover" />
         ) : (
           <div className="flex h-80 items-center justify-center p-5 text-center text-sm text-zinc-500">
@@ -36,6 +40,7 @@ export default function BodyTwin() {
   const [avatarBusy, setAvatarBusy] = useState(false);
   const [avatarError, setAvatarError] = useState(null);
   const baseUrl = import.meta.env.VITE_API_BASE_URL;
+  const weightInvalid = !Number.isFinite(weightKg) || weightKg < 30 || weightKg > 250;
 
   const predicted = useMemo(() => {
     const h = horizonDays / 30;
@@ -116,15 +121,18 @@ export default function BodyTwin() {
             <div className="mt-5 grid gap-5 md:grid-cols-2">
               <label className="block">
                 <span className="text-xs font-medium text-zinc-500">Body type</span>
-                <select
-                  value={bodyType}
-                  onChange={(e) => setBodyType(e.target.value)}
-                  className="pt-select"
-                >
-                  <option value="slim">Slim</option>
-                  <option value="average">Average</option>
-                  <option value="broad">Broad</option>
-                </select>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {['slim', 'average', 'broad'].map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => setBodyType(t)}
+                      className={`${chipBase} ${bodyType === t ? chipActive : chipInactive}`}
+                    >
+                      {t[0].toUpperCase() + t.slice(1)}
+                    </button>
+                  ))}
+                </div>
               </label>
               <label className="block">
                 <span className="text-xs font-medium text-zinc-500">Current weight (kg)</span>
@@ -134,6 +142,9 @@ export default function BodyTwin() {
                   onChange={(e) => setWeightKg(Number(e.target.value))}
                   className="pt-input"
                 />
+                {weightInvalid ? (
+                  <span className="mt-1 block text-xs text-red-400">Enter a valid weight (30-250).</span>
+                ) : null}
               </label>
               <div className="md:col-span-2">
                 <div className="text-xs font-medium text-zinc-500">Preview timeline</div>
@@ -157,7 +168,7 @@ export default function BodyTwin() {
                   generateAvatars();
                 }}
                 className="pt-btn-primary md:col-span-2"
-                disabled={avatarBusy}
+                disabled={avatarBusy || weightInvalid}
               >
                 {avatarBusy ? 'Generating...' : 'Generate My Twin'}
               </button>
@@ -172,52 +183,21 @@ export default function BodyTwin() {
                 subtitle={`${weightKg} kg · ${bodyType} build`}
                 imageDataUrl={currentAvatar}
                 fallbackText="Tap Generate My Twin above"
+                loading={avatarBusy}
               />
               <AvatarCard
                 title="Projected"
                 subtitle={`${predicted.weightKg} kg · ${predicted.bodyFatPct}% fat · ${predicted.fitnessLevel}/10 fitness`}
                 imageDataUrl={futureAvatar}
                 fallbackText="Future avatar will appear here"
+                loading={avatarBusy}
               />
             </div>
             {avatarError ? <div className="mt-3 text-sm text-red-400">{avatarError}</div> : null}
           </div>
 
-          <div className="pt-card p-5 sm:p-6">
-            <div className="text-sm font-semibold text-zinc-100">Daily habit impact</div>
-            <div className="mt-2 text-xs text-zinc-500">
-              Tap once per action and see your projection change.
-            </div>
-            <div className="mt-4 grid gap-2 sm:grid-cols-3">
-              <button
-                type="button"
-                onClick={() => setSimulationScore((s) => clamp(s + 2, -10, 20))}
-                className="rounded-xl border border-zinc-700 bg-zinc-900/50 px-4 py-3 text-left text-sm font-medium text-zinc-200 transition-colors hover:border-zinc-600 hover:bg-zinc-800/80"
-              >
-                + Workout done
-              </button>
-              <button
-                type="button"
-                onClick={() => setSimulationScore((s) => clamp(s - 2, -10, 20))}
-                className="rounded-xl border border-zinc-700 bg-zinc-900/50 px-4 py-3 text-left text-sm font-medium text-zinc-200 transition-colors hover:border-zinc-600 hover:bg-zinc-800/80"
-              >
-                − Junk meal
-              </button>
-              <button
-                type="button"
-                onClick={() => setSimulationScore(0)}
-                className="rounded-xl border border-zinc-700 bg-zinc-900/50 px-4 py-3 text-left text-sm font-medium text-zinc-200 transition-colors hover:border-zinc-600 hover:bg-zinc-800/80"
-              >
-                Reset
-              </button>
-            </div>
-            <div className="mt-4 text-xs text-zinc-500">
-              Momentum:{' '}
-              <span className="font-semibold tabular-nums text-zinc-200">{simulationScore}</span>
-            </div>
-            <div className="mt-5 rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 text-sm leading-relaxed text-zinc-300">
-              {friendlySummary}
-            </div>
+          <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 text-sm leading-relaxed text-zinc-300">
+            {friendlySummary}
           </div>
 
           <div className="grid gap-4 md:grid-cols-2">

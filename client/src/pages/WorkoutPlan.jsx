@@ -431,7 +431,7 @@ export default function WorkoutPlan() {
                   onClick={() => toggleChip(t.key)}
                   className={`rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
                     selected
-                      ? 'border-fit-lime bg-fit-lime text-black'
+                      ? 'border-fit-lime bg-fit-lime text-white'
                       : 'border-white/10 bg-black/30 text-fit-muted hover:border-white/15 hover:bg-white/5'
                   }`}
                 >

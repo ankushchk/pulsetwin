@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { usePulseTwin } from '../state/PulseTwinProvider.jsx';
+import { useAuth } from '../state/AuthProvider.jsx';
 
 function getWeekId(d = new Date()) {
   const date = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
@@ -7,15 +8,6 @@ function getWeekId(d = new Date()) {
   const diffToMonday = (day + 6) % 7;
   date.setUTCDate(date.getUTCDate() - diffToMonday);
   return date.toISOString().slice(0, 10);
-}
-
-function getOrCreateUserId() {
-  const key = 'pulseUserId';
-  const existing = window.localStorage.getItem(key);
-  if (existing) return existing;
-  const id = window.crypto?.randomUUID ? window.crypto.randomUUID() : `local-${Math.random().toString(16).slice(2)}`;
-  window.localStorage.setItem(key, id);
-  return id;
 }
 
 function deepLinksForItem(itemName) {
@@ -33,10 +25,11 @@ function formatRs(n) {
 }
 
 export default function Grocery() {
-  const { bodyTwin } = usePulseTwin();
+  const { bodyTwin, nutritionLogs } = usePulseTwin();
+  const { user } = useAuth();
   const baseUrl = import.meta.env.VITE_API_BASE_URL;
 
-  const [userId] = useState(() => getOrCreateUserId());
+  const userId = user?.uid || null;
   const [weekId] = useState(() => getWeekId());
 
   const [whatsappTo, setWhatsappTo] = useState(
@@ -90,6 +83,7 @@ export default function Grocery() {
           userId,
           weekId,
           bodyTwin,
+          nutritionLogs,
           whatsappTo: whatsappTo || null
         })
       });
@@ -109,7 +103,7 @@ export default function Grocery() {
   };
 
   useEffect(() => {
-    if (!baseUrl) return;
+    if (!baseUrl || !userId) return;
     loadOrGenerate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [baseUrl, userId, weekId]);
@@ -147,6 +141,12 @@ export default function Grocery() {
   return (
     <div className="pt-page">
       <div className="pt-container max-w-4xl">
+        {!userId ? (
+          <div className="mt-4 rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 text-sm text-zinc-400">
+            Initializing your secure profile...
+          </div>
+        ) : null}
+
         <div className="pt-label">Grocery</div>
         <div className="mt-1 flex flex-wrap items-center justify-between gap-3">
           <h1 className="pt-title">This week&apos;s list</h1>
@@ -206,6 +206,28 @@ export default function Grocery() {
 
         {groceryList ? (
           <div className="mt-8 space-y-6">
+            {Array.isArray(groceryList?.mealSuggestions) && groceryList.mealSuggestions.length ? (
+              <div className="pt-card p-5 sm:p-6">
+                <div className="text-sm font-semibold text-zinc-100">
+                  Meal suggestions from your nutrition deficiencies
+                </div>
+                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                  {groceryList.mealSuggestions.map((m, idx) => (
+                    <div key={`${m?.meal || 'meal'}-${idx}`} className="rounded-xl border border-zinc-800 bg-zinc-950/40 p-4">
+                      <div className="text-sm font-semibold text-zinc-100">{m?.meal || 'Meal'}</div>
+                      <div className="mt-2 text-xs text-zinc-400">{m?.why || '-'}</div>
+                      <div className="mt-2 text-xs text-zinc-500">
+                        Nutrients: {Array.isArray(m?.keyNutrients) && m.keyNutrients.length ? m.keyNutrients.join(', ') : '-'}
+                      </div>
+                      <div className="mt-1 text-xs text-zinc-500">
+                        Estimated cost: {formatRs(m?.estimatedCost)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {Object.keys(itemsByCategory).length ? (
               Object.entries(itemsByCategory).map(([category, items]) => (
                 <div key={category} className="pt-card p-5 sm:p-6">
