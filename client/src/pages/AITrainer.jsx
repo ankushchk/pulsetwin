@@ -73,12 +73,12 @@ export default function AITrainer() {
 
   const repStateRef = useRef({
     squatDown: false,
-    squatDepthFrames: 0,
-    squatUpFrames: 0,
     pushDown: false,
     lungeDown: false,
     wasJackOpen: false,
     plankActive: false,
+    repLock: null,
+    repLockAt: 0,
     lastRepAt: {
       squats: 0,
       pushups: 0,
@@ -87,6 +87,7 @@ export default function AITrainer() {
       planks: 0
     }
   });
+  const [debugPosture, setDebugPosture] = useState('');
 
   const [flashKey, setFlashKey] = useState(null);
 
@@ -158,7 +159,6 @@ export default function AITrainer() {
     const minElbowAngle = Math.min(leftElbowAngle, rightElbowAngle);
     const maxElbowAngle = Math.max(leftElbowAngle, rightElbowAngle);
 
-    // Shared posture signals to reduce cross-exercise false positives.
     const leftHipLineAngle = angle(lShoulder, lHip, lAnkle);
     const rightHipLineAngle = angle(rShoulder, rHip, rAnkle);
     const bodyLineAngle = Math.min(leftHipLineAngle, rightHipLineAngle);
@@ -166,141 +166,153 @@ export default function AITrainer() {
     const avgShoulderY = (lShoulder.y + rShoulder.y) / 2;
     const avgHipY = (lHip.y + rHip.y) / 2;
     const avgKneeY = (lKnee.y + rKnee.y) / 2;
-    const torsoNearlyHorizontal = Math.abs(avgShoulderY - avgHipY) < 0.2;
-    const pushupReadyPose = kneesStraight && bodyLineAngle > 145 && torsoNearlyHorizontal;
     const hipKneeDelta = avgKneeY - avgHipY;
-    const standingPose = hipKneeDelta > 0.08 && avgShoulderY < avgHipY;
-    const floorPose =
-      Math.abs(avgHipY - avgKneeY) < 0.12 && avgShoulderY >= avgHipY - 0.03;
+
+    // Upright torso stays true even during squats (shoulders above hips).
+    const uprightTorso = avgShoulderY + 0.02 < avgHipY;
+    const torsoNearlyHorizontal = Math.abs(avgShoulderY - avgHipY) < 0.18;
+    const onFloor =
+      Math.abs(avgHipY - avgKneeY) < 0.15 && torsoNearlyHorizontal;
+    const pushupReadyPose =
+      kneesStraight && bodyLineAngle > 140 && torsoNearlyHorizontal;
+
     const shoulderDist = Math.abs(lShoulder.x - rShoulder.x);
     const armDist = Math.abs(lWrist.x - rWrist.x);
     const hipDist = Math.abs(lHip.x - rHip.x);
     const legDist = Math.abs(lAnkle.x - rAnkle.x);
-    const armOpen = shoulderDist > 0.001 && armDist / shoulderDist > 1.35;
-    const legOpen = hipDist > 0.001 && legDist / hipDist > 1.35;
-    const wristsAboveShoulders = lWrist.y < lShoulder.y && rWrist.y < rShoulder.y;
-    const jackOpen = standingPose && armOpen && legOpen && wristsAboveShoulders;
+    const armOpen = shoulderDist > 0.001 && armDist / shoulderDist > 1.4;
+    const legOpen = hipDist > 0.001 && legDist / hipDist > 1.3;
+    const wristsAboveShoulders =
+      lWrist.y < lShoulder.y && rWrist.y < rShoulder.y;
+    const jackOpen = uprightTorso && armOpen && legOpen && wristsAboveShoulders;
 
-    // In "all" mode, count only one dominant movement to avoid cross-exercise increments.
-    let activeInFrame = activeKeys;
+    // In "all" mode, use a rep-lock: once a rep starts for one exercise,
+    // lock out others until that rep finishes or 2s timeout elapses.
+    let effectiveKeys = activeKeys;
     if (mode === 'all') {
-      const candidates = [];
-      if (standingPose && (minKneeAngle < 130 || repState.squatDown)) {
-        candidates.push({ key: 'squats', score: 200 - minKneeAngle });
+      if (
+        repState.repLock &&
+        now - repState.repLockAt < 2000
+      ) {
+        effectiveKeys = new Set([repState.repLock]);
+      } else {
+        repState.repLock = null;
       }
-      if (standingPose && Math.abs(leftKneeAngle - rightKneeAngle) > 18 && minKneeAngle < 125) {
-        candidates.push({ key: 'lunges', score: 180 - minKneeAngle });
-      }
-      if (jackOpen || repState.wasJackOpen) {
-        candidates.push({ key: 'jacks', score: 90 });
-      }
-      if (pushupReadyPose && floorPose) {
-        candidates.push({ key: 'pushups', score: 170 - minElbowAngle });
-      }
-      if (kneesStraight && bodyLineAngle > 150 && floorPose) {
-        candidates.push({ key: 'planks', score: 40 });
-      }
-
-      const chosen = candidates.sort((a, b) => b.score - a.score)[0]?.key || null;
-      activeInFrame = new Set(chosen ? [chosen] : []);
     }
 
-    // --- Squats ---
-    if (activeInFrame.has('squats') && standingPose) {
-      const bottom = 105;
-      const top = 145;
-      const deepByHeight = hipKneeDelta < 0.13;
-      const standingTall = hipKneeDelta > 0.18;
-      repState.squatDepthFrames =
-        minKneeAngle < bottom || deepByHeight ? repState.squatDepthFrames + 1 : 0;
-      repState.squatUpFrames =
-        minKneeAngle > top || standingTall ? repState.squatUpFrames + 1 : 0;
+    let dbg = uprightTorso ? 'UPRIGHT' : onFloor ? 'FLOOR' : '?';
 
-      if (!repState.squatDown && repState.squatDepthFrames >= 2) {
+    // --- Squats ---
+    // Gate: uprightTorso for entry; once squatDown is true, allow completion
+    // regardless of posture (hips drop during squat).
+    if (effectiveKeys.has('squats')) {
+      const isDown = minKneeAngle < 130 || hipKneeDelta < 0.10;
+      const isUp = minKneeAngle > 155 && hipKneeDelta > 0.14;
+
+      if (!repState.squatDown && uprightTorso && isDown) {
         repState.squatDown = true;
-      } else if (repState.squatDown && repState.squatUpFrames >= 2) {
-        // debounce
-        if (now - repState.lastRepAt.squats > 900) {
+        if (mode === 'all') {
+          repState.repLock = 'squats';
+          repState.repLockAt = now;
+        }
+        dbg = 'SQUAT ↓';
+      } else if (repState.squatDown && isUp) {
+        if (now - repState.lastRepAt.squats > 600) {
           repState.lastRepAt.squats = now;
           bumpRep('squats');
         }
         repState.squatDown = false;
-        repState.squatDepthFrames = 0;
-        repState.squatUpFrames = 0;
+        repState.repLock = null;
+        dbg = 'SQUAT ↑';
       }
-    } else {
+    } else if (!repState.squatDown) {
       repState.squatDown = false;
-      repState.squatDepthFrames = 0;
-      repState.squatUpFrames = 0;
     }
 
     // --- Pushups ---
-    if (activeInFrame.has('pushups')) {
-      const bottom = 90;
-      const top = 150;
-      if (pushupReadyPose && floorPose) {
-        if (!repState.pushDown && minElbowAngle < bottom) {
+    if (effectiveKeys.has('pushups')) {
+      if (pushupReadyPose && onFloor) {
+        if (!repState.pushDown && minElbowAngle < 100) {
           repState.pushDown = true;
-        } else if (repState.pushDown && maxElbowAngle > top) {
-          if (now - repState.lastRepAt.pushups > 350) {
+          if (mode === 'all') {
+            repState.repLock = 'pushups';
+            repState.repLockAt = now;
+          }
+          dbg = 'PUSH ↓';
+        } else if (repState.pushDown && maxElbowAngle > 145) {
+          if (now - repState.lastRepAt.pushups > 500) {
             repState.lastRepAt.pushups = now;
             bumpRep('pushups');
           }
           repState.pushDown = false;
+          repState.repLock = null;
+          dbg = 'PUSH ↑';
         }
-      } else {
-        // Reset transition state when user is not in pushup posture.
+      } else if (!repState.pushDown) {
         repState.pushDown = false;
       }
     }
 
     // --- Lunges ---
-    if (activeInFrame.has('lunges') && standingPose) {
-      const bottom = 115;
-      const top = 150;
-      if (!repState.lungeDown && minKneeAngle < bottom) {
+    if (effectiveKeys.has('lunges')) {
+      const kneeAsymmetry = Math.abs(leftKneeAngle - rightKneeAngle);
+      if (!repState.lungeDown && uprightTorso && minKneeAngle < 125 && kneeAsymmetry > 15) {
         repState.lungeDown = true;
-      } else if (repState.lungeDown && maxKneeAngle > top) {
-        if (now - repState.lastRepAt.lunges > 400) {
+        if (mode === 'all') {
+          repState.repLock = 'lunges';
+          repState.repLockAt = now;
+        }
+        dbg = 'LUNGE ↓';
+      } else if (repState.lungeDown && maxKneeAngle > 155) {
+        if (now - repState.lastRepAt.lunges > 500) {
           repState.lastRepAt.lunges = now;
           bumpRep('lunges');
         }
         repState.lungeDown = false;
+        repState.repLock = null;
+        dbg = 'LUNGE ↑';
       }
-    } else {
+    } else if (!repState.lungeDown) {
       repState.lungeDown = false;
     }
 
     // --- Jumping Jacks ---
-    if (activeInFrame.has('jacks')) {
+    if (effectiveKeys.has('jacks')) {
       if (jackOpen && !repState.wasJackOpen) {
         if (now - repState.lastRepAt.jacks > 700) {
           repState.lastRepAt.jacks = now;
           bumpRep('jacks');
         }
         repState.wasJackOpen = true;
+        if (mode === 'all') {
+          repState.repLock = 'jacks';
+          repState.repLockAt = now;
+        }
+        dbg = 'JACK ✓';
       } else if (!jackOpen) {
         repState.wasJackOpen = false;
+        if (repState.repLock === 'jacks') repState.repLock = null;
       }
     } else {
       repState.wasJackOpen = false;
     }
 
     // --- Planks ---
-    if (activeInFrame.has('planks')) {
-      const plankCriteria = kneesStraight && bodyLineAngle > 150;
-      const validPlankPosture = plankCriteria && floorPose;
-
-      if (validPlankPosture && !repState.plankActive) {
+    if (effectiveKeys.has('planks')) {
+      const validPlank = kneesStraight && bodyLineAngle > 150 && onFloor;
+      if (validPlank && !repState.plankActive) {
         if (now - repState.lastRepAt.planks > 800) {
           repState.lastRepAt.planks = now;
           bumpRep('planks');
         }
         repState.plankActive = true;
-      } else if (!validPlankPosture) {
+        dbg = 'PLANK';
+      } else if (!validPlank) {
         repState.plankActive = false;
       }
     }
+
+    setDebugPosture(dbg);
   };
 
   const start = async () => {
@@ -324,12 +336,12 @@ export default function AITrainer() {
     setFlashKey(null);
     repStateRef.current = {
       squatDown: false,
-      squatDepthFrames: 0,
-      squatUpFrames: 0,
       pushDown: false,
       lungeDown: false,
       wasJackOpen: false,
       plankActive: false,
+      repLock: null,
+      repLockAt: 0,
       lastRepAt: { squats: 0, pushups: 0, lunges: 0, jacks: 0, planks: 0 }
     };
 
@@ -582,6 +594,11 @@ export default function AITrainer() {
               <div className="absolute left-3 top-3 rounded-xl border border-white/10 bg-black/75 px-3 py-1.5 text-xs text-fit-muted backdrop-blur-md">
                 {status} {landmarkFrames ? `• landmarks: ${landmarkFrames}` : ''}
               </div>
+              {running && debugPosture && (
+                <div className="absolute right-3 top-3 rounded-xl border border-fit-lime/30 bg-black/80 px-3 py-1.5 text-xs font-bold text-fit-lime backdrop-blur-md">
+                  {debugPosture}
+                </div>
+              )}
             </div>
 
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
