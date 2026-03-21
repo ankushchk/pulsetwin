@@ -1,4 +1,5 @@
 # Pulse Twin
+[DEMO VIDEO](https://drive.google.com/file/d/1wf0xa2TpgHz7eyKgvkoP5L5DcorB4uUU/view)
 
 A fitness companion web app: **Body Twin** (digital self model), **meal logging**, **voice check-ins**, **AI workout planning**, **pose-based AI trainer**, **grocery agent** with optional WhatsApp (Twilio), and **progress** views. The UI is a **React (Vite)** SPA; AI and integrations run through a small **Node (Express)** backend.
 
